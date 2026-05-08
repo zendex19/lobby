@@ -14,21 +14,22 @@ import (
 )
 
 var upgrader = websocket.Upgrader{
-	CheckOrigin: func(r *http.Request) bool {
-		return true // Allow all for prototyping
-	},
+	CheckOrigin: func(r *http.Request) bool { return true },
 }
 
+// Client now owns a send channel — one writer goroutine per connection.
 type Client struct {
 	conn     *websocket.Conn
+	send     chan []byte // buffered; writer goroutine drains this
 	Username string
 	LocalIPs []string
 	PublicIP string
 }
 
+// Use RawMessage so we never double-encode/decode the payload.
 type Message struct {
-	Type    string      `json:"type"` // "register", "clients", "call_request", "call_response"
-	Payload interface{} `json:"payload"`
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
 }
 
 type RegisterPayload struct {
@@ -41,23 +42,46 @@ type CallRequestPayload struct {
 }
 
 var (
-	clients = make(map[*websocket.Conn]*Client)
-	mu      sync.Mutex
-
+	// RWMutex: reads (lookup, broadcast snapshot) no longer block each other.
+	clients      = make(map[*websocket.Conn]*Client)
+	mu           sync.RWMutex
 	relayAddress string
 )
 
 func main() {
 	port := flag.Int("port", 8080, "Port to run the lobby server on")
-	flag.StringVar(&relayAddress, "relay", "ws://localhost:8081/ws", "Address of the relay server to provide out to clients")
+	flag.StringVar(&relayAddress, "relay", "ws://localhost:8081/ws", "Relay server address")
 	flag.Parse()
 
 	http.HandleFunc("/ws", handleConnections)
+	log.Printf("Lobby server listening on :%d", *port)
+	if err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil); err != nil {
+		log.Fatal(err)
+	}
+}
 
-	log.Printf("Starting Lobby Server on :%d\n", *port)
-	err := http.ListenAndServe(fmt.Sprintf(":%d", *port), nil)
+// writePump serializes all writes for one connection.
+// Gorilla websocket requires that only one goroutine writes at a time.
+func (c *Client) writePump() {
+	defer c.conn.Close()
+	for data := range c.send {
+		if err := c.conn.WriteMessage(websocket.TextMessage, data); err != nil {
+			return
+		}
+	}
+}
+
+// sendJSON encodes v and queues it for the client's writer goroutine.
+// Non-blocking: drops the message if the buffer is full (slow client).
+func (c *Client) sendJSON(v interface{}) {
+	data, err := json.Marshal(v)
 	if err != nil {
-		log.Fatal("ListenAndServe: ", err)
+		return
+	}
+	select {
+	case c.send <- data:
+	default:
+		log.Printf("send buffer full for %s, dropping message", c.Username)
 	}
 }
 
@@ -67,13 +91,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		log.Println(err)
 		return
 	}
-	defer ws.Close()
 
-	// Capture the public IP of the connecting client
 	publicIP, _, _ := net.SplitHostPort(r.RemoteAddr)
-
 	client := &Client{
 		conn:     ws,
+		send:     make(chan []byte, 64), // buffer up to 64 outbound messages
 		PublicIP: publicIP,
 	}
 
@@ -81,9 +103,13 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 	clients[ws] = client
 	mu.Unlock()
 
+	// One goroutine owns all writes for this connection.
+	go client.writePump()
+
 	defer func() {
 		mu.Lock()
 		delete(clients, ws)
+		close(client.send) // signals writePump to exit
 		mu.Unlock()
 		broadcastClients()
 		log.Printf("Client disconnected: %s", client.Username)
@@ -94,13 +120,11 @@ func handleConnections(w http.ResponseWriter, r *http.Request) {
 		if err != nil {
 			break
 		}
-
 		var msg Message
 		if err := json.Unmarshal(msgBytes, &msg); err != nil {
-			log.Println("Invalid message format:", err)
+			log.Println("Invalid message:", err)
 			continue
 		}
-
 		handleMessage(client, msg)
 	}
 }
@@ -109,66 +133,60 @@ func handleMessage(client *Client, msg Message) {
 	switch msg.Type {
 	case "register":
 		var payload RegisterPayload
-		b, _ := json.Marshal(msg.Payload)
-		json.Unmarshal(b, &payload)
-
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return
+		}
 		client.Username = payload.Username
 		client.LocalIPs = payload.LocalIPs
-
-		log.Printf("Client registered: %s (Public IP: %s, Local IPs: %v)", client.Username, client.PublicIP, client.LocalIPs)
+		log.Printf("Registered: %s (public: %s, local: %v)", client.Username, client.PublicIP, client.LocalIPs)
 		broadcastClients()
 
 	case "call":
 		var payload CallRequestPayload
-		b, _ := json.Marshal(msg.Payload)
-		json.Unmarshal(b, &payload)
+		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return
+		}
+		log.Printf("Call request: %s → %s", client.Username, payload.TargetUsername)
 
-		log.Printf("Received call request from %s to %s", client.Username, payload.TargetUsername)
-
-		mu.Lock()
-		var targetClient *Client
+		// Read lock is enough — we're only looking up.
+		mu.RLock()
+		var target *Client
 		for _, c := range clients {
 			if c.Username == payload.TargetUsername {
-				targetClient = c
+				target = c
 				break
 			}
 		}
-		mu.Unlock()
+		mu.RUnlock()
 
-		if targetClient == nil {
-			client.conn.WriteJSON(Message{
-				Type: "error",
-				Payload: map[string]string{
-					"message": "User not found",
-				},
+		if target == nil {
+			client.sendJSON(map[string]interface{}{
+				"type":    "error",
+				"payload": map[string]string{"message": "User not found"},
 			})
 			return
 		}
 
 		routeType := "relay"
-		if client.PublicIP == targetClient.PublicIP {
+		if client.PublicIP == target.PublicIP {
 			routeType = "lan"
 		}
+		sessionID := fmt.Sprintf("%s-%s-%d", client.Username, target.Username, time.Now().UnixNano())
 
-		sessionID := fmt.Sprintf("%s-%s-%d", client.Username, targetClient.Username, time.Now().UnixNano())
-
-		// Notify the caller
-		client.conn.WriteJSON(Message{
-			Type: "call_routing",
-			Payload: map[string]interface{}{
-				"target_username": targetClient.Username,
+		client.sendJSON(map[string]interface{}{
+			"type": "call_routing",
+			"payload": map[string]interface{}{
+				"target_username": target.Username,
 				"route_type":      routeType,
-				"target_ips":      targetClient.LocalIPs,
-				"target_public":   targetClient.PublicIP,
+				"target_ips":      target.LocalIPs,
+				"target_public":   target.PublicIP,
 				"relay_address":   relayAddress,
 				"session_id":      sessionID,
 			},
 		})
-
-		// Notify the target
-		targetClient.conn.WriteJSON(Message{
-			Type: "incoming_call",
-			Payload: map[string]interface{}{
+		target.sendJSON(map[string]interface{}{
+			"type": "incoming_call",
+			"payload": map[string]interface{}{
 				"caller_username": client.Username,
 				"route_type":      routeType,
 				"caller_ips":      client.LocalIPs,
@@ -181,29 +199,36 @@ func handleMessage(client *Client, msg Message) {
 }
 
 func broadcastClients() {
-	mu.Lock()
-	defer mu.Unlock()
-
-	var activeClients []map[string]interface{}
+	// 1. Build the payload under a read lock.
+	mu.RLock()
+	active := make([]map[string]interface{}, 0, len(clients))
+	snapshot := make([]*Client, 0, len(clients))
 	for _, c := range clients {
 		if c.Username != "" {
-			activeClients = append(activeClients, map[string]interface{}{
+			active = append(active, map[string]interface{}{
 				"username":  c.Username,
 				"public_ip": c.PublicIP,
 			})
+			snapshot = append(snapshot, c)
 		}
 	}
+	mu.RUnlock()
 
-	msg := Message{
-		Type:    "clients",
-		Payload: activeClients,
+	// 2. Encode once — reuse the same bytes for every client.
+	data, err := json.Marshal(map[string]interface{}{
+		"type":    "clients",
+		"payload": active,
+	})
+	if err != nil {
+		return
 	}
 
-	for ws := range clients {
-		err := ws.WriteJSON(msg)
-		if err != nil {
-			log.Printf("Error sending clients to %s: %v", clients[ws].Username, err)
-			ws.Close()
+	// 3. Queue to each client's channel — no lock held, no I/O blocking.
+	for _, c := range snapshot {
+		select {
+		case c.send <- data:
+		default:
+			log.Printf("broadcast: send buffer full for %s", c.Username)
 		}
 	}
 }
