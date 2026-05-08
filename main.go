@@ -136,14 +136,45 @@ func handleMessage(client *Client, msg Message) {
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
 			return
 		}
+		if payload.Username == "" {
+			client.sendJSON(map[string]interface{}{
+				"type":    "error",
+				"payload": map[string]string{"message": "username cannot be empty"},
+			})
+			return
+		}
+		mu.Lock()
+		for conn, c := range clients {
+			if c != client && c.Username == payload.Username {
+				log.Printf("[Lobby] Evicting ghost: %s", c.Username)
+				conn.Close()
+				close(c.send)
+				delete(clients, conn)
+			}
+		}
 		client.Username = payload.Username
 		client.LocalIPs = payload.LocalIPs
+		mu.Unlock()
 		log.Printf("Registered: %s (public: %s, local: %v)", client.Username, client.PublicIP, client.LocalIPs)
 		broadcastClients()
 
 	case "call":
 		var payload CallRequestPayload
 		if err := json.Unmarshal(msg.Payload, &payload); err != nil {
+			return
+		}
+		if client.Username == "" {
+			client.sendJSON(map[string]interface{}{
+				"type":    "error",
+				"payload": map[string]string{"message": "register before calling"},
+			})
+			return
+		}
+		if payload.TargetUsername == client.Username {
+			client.sendJSON(map[string]interface{}{
+				"type":    "error",
+				"payload": map[string]string{"message": "cannot call yourself"},
+			})
 			return
 		}
 		log.Printf("Call request: %s → %s", client.Username, payload.TargetUsername)
