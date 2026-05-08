@@ -148,7 +148,6 @@ func handleMessage(client *Client, msg Message) {
 			if c != client && c.Username == payload.Username {
 				log.Printf("[Lobby] Evicting ghost: %s", c.Username)
 				conn.Close()
-				close(c.send)
 				delete(clients, conn)
 			}
 		}
